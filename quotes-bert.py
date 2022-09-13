@@ -1,6 +1,7 @@
 import argparse
 from collections import defaultdict
 import csv
+import re
 
 import pyarrow as pa
 
@@ -10,31 +11,44 @@ from transformers import \
     DataCollatorForTokenClassification, TrainingArguments, Trainer
 
 
+# TODO
+# - commands: "train", "eval"
+
 def load_dataset_from_conll(filename):
-    # TODO include paragraph breaks?
-    doc_ids, s_ids, w_ids, tokens = [], [], [], []
-    cur_doc_id, cur_s_ids, cur_w_ids, cur_tokens = None, [], [], []
+    pat = re.compile(r'SpacesAfter=.*\\n.*')
+    doc_ids, par_ids, s_ids, w_ids, tokens = [], [], [], [], []
+    cur_doc_id, cur_par_id, cur_s_ids, cur_w_ids, cur_tokens = None, None, [], [], []
     with open(filename) as fp:
         reader = csv.DictReader(fp)
         for row in reader:
-            if row['articleId'] != cur_doc_id:
+            if row['articleId'] != cur_doc_id or row['paragraphId'] != cur_par_id:
                 if cur_tokens:
                     doc_ids.append(cur_doc_id)
+                    par_ids.append(int(cur_par_id))
                     s_ids.append(cur_s_ids)
                     w_ids.append(cur_w_ids)
                     tokens.append(cur_tokens)
                     cur_s_ids, cur_w_ids, cur_tokens = [], [], []
                 cur_doc_id = row['articleId']
+                cur_par_id = row['paragraphId']
             cur_s_ids.append(int(row['sentenceId']))
             cur_w_ids.append(int(row['wordId']))
             cur_tokens.append(row['word'])
+            if pat.search(row['misc']) and tokens:
+                doc_ids.append(cur_doc_id)
+                par_ids.append(int(cur_par_id))
+                s_ids.append(cur_s_ids)
+                w_ids.append(cur_w_ids)
+                tokens.append(cur_tokens)
+                cur_s_ids, cur_w_ids, cur_tokens = [], [], []
         if cur_tokens:
             doc_ids.append(cur_doc_id)
+            par_ids.append(int(cur_par_id))
             s_ids.append(cur_s_ids)
             w_ids.append(cur_w_ids)
             tokens.append(cur_tokens)
-    return Dataset(pa.table([doc_ids, s_ids, w_ids, tokens],
-                            names=['doc_id', 's_ids', 'w_ids', 'tokens']))
+    return Dataset(pa.table([doc_ids, par_ids, s_ids, w_ids, tokens],
+                            names=['doc_id', 'par_id', 's_ids', 'w_ids', 'tokens']))
 
 def load_annotations(filename):
     doc_id, anns = None, []
@@ -56,12 +70,25 @@ def add_quote_annotations(docs, anns):
             tok_inv_dict = { (d['s_ids'][i], d['w_ids'][i]) : i \
                              for i in range(len(d['s_ids'])) }
             for a in anns[d['doc_id']]:
-                i = tok_inv_dict[(int(a['startSentenceId']), int(a['startWordId']))]
+                start_idx = (int(a['startSentenceId']), int(a['startWordId']))
+                i = None
+                if start_idx in tok_inv_dict:
+                    i = tok_inv_dict[start_idx]
+                elif (d['s_ids'][0] > int(a['startSentenceId']) \
+                      or (d['s_ids'][0] == int(a['startSentenceId']) \
+                          and d['w_ids'][0] > int(a['startWordId']))) \
+                      and (d['s_ids'][0] < int(a['endSentenceId']) \
+                           or (d['s_ids'][0] == int(a['endSentenceId']) \
+                               and d['w_ids'][0] < int(a['endWordId']))):
+                    i = 0
+                else:
+                    continue
                 lbl_direct = 'DIRECT' if a['direct'] == 'true' else 'INDIRECT'
                 labels[i] = 'B-{}'.format(lbl_direct)
                 i += 1
-                while d['s_ids'][i] < int(a['endSentenceId']) \
-                      or d['w_ids'][i] < int(a['endWordId']):
+                while i < len(d['tokens']) \
+                      and (d['s_ids'][i] < int(a['endSentenceId']) \
+                           or d['w_ids'][i] < int(a['endWordId'])):
                     labels[i] = 'I-{}'.format(lbl_direct)
                     i += 1
         labels_per_doc.append(labels)
