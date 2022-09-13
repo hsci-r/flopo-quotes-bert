@@ -69,8 +69,8 @@ def add_quote_annotations(docs, anns):
                .cast_column('quote-tags', cl)
     return docs
 
-def tokenize_and_align_labels(examples):
-    tokenized_inputs = tokenizer(examples['tokens'], truncation=True, is_split_into_words=True)
+def tokenize_and_align_labels(examples, max_length):
+    tokenized_inputs = tokenizer(examples['tokens'], truncation=True, is_split_into_words=True, max_length=max_length)
     labels = []
     for i, label in enumerate(examples['quote-tags']):
         word_ids = tokenized_inputs.word_ids(batch_index=i)
@@ -91,9 +91,12 @@ def tokenize_and_align_labels(examples):
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description='Rule-based quote detection.')
+    parser = argparse.ArgumentParser(description='Quote detection using BERT.')
     parser.add_argument('-i', '--input-file', metavar='FILE')
+    parser.add_argument('-m', '--model-dir', metavar='DIR')
     parser.add_argument('-a', '--annotations-file', metavar='FILE')
+    parser.add_argument('-n', '--max-length', type=int, default=20,
+                        help='maximum sequence length')
     return parser.parse_args()
 
 
@@ -109,24 +112,26 @@ if __name__ == '__main__':
                 'TurkuNLP/bert-base-finnish-cased-v1',
                 num_labels=5)
     
-    tokenized_docs = docs.map(tokenize_and_align_labels, batched=True)
+    tokenized_docs = docs.map(
+        lambda x: tokenize_and_align_labels(x, args.max_length),
+        batched=True)
     
-    data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
+    data_collator = DataCollatorForTokenClassification(
+        tokenizer=tokenizer,
+        padding='max_length')
     training_args = TrainingArguments(
-        output_dir="./results",
+        output_dir=args.model_dir,
         learning_rate=2e-5,
         per_device_train_batch_size=16,
-        num_train_epochs=3,
-        weight_decay=0.01,
-    )
+        num_train_epochs=1,
+        weight_decay=0.01)
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_docs,
         tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
+        data_collator=data_collator)
     trainer.train()
     
-    # FIXME training very slow and takes huge amounts of memory -> too long sequences?
-    
+    model.save_pretrained(args.model_dir)
+
