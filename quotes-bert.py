@@ -3,6 +3,7 @@ from collections import defaultdict
 import csv
 import re
 
+import numpy as np
 import pyarrow as pa
 
 from datasets import load_dataset, Dataset, ClassLabel, Sequence
@@ -124,6 +125,8 @@ def parse_arguments():
     parser.add_argument('-a', '--annotations-file', metavar='FILE')
     parser.add_argument('-n', '--max-length', type=int, default=20,
                         help='maximum sequence length')
+    parser.add_argument('--epochs', type=int, default=10,
+                        help='training epochs')
     return parser.parse_args()
 
 
@@ -133,7 +136,7 @@ if __name__ == '__main__':
     docs = load_dataset_from_conll(args.input_file)
     anns = load_annotations(args.annotations_file)
     docs = add_quote_annotations(docs, anns)
-    
+
     tokenizer = AutoTokenizer.from_pretrained('TurkuNLP/bert-base-finnish-cased-v1')
     model = AutoModelForTokenClassification.from_pretrained(
                 'TurkuNLP/bert-base-finnish-cased-v1',
@@ -150,12 +153,13 @@ if __name__ == '__main__':
         output_dir=args.model_dir,
         learning_rate=2e-5,
         per_device_train_batch_size=16,
-        num_train_epochs=1,
+        num_train_epochs=args.epochs,
         weight_decay=0.01)
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_docs,
+        eval_dataset=tokenized_docs.select(np.random.choice(len(tokenized_docs), int(len(tokenized_docs)*0.1))),
         tokenizer=tokenizer,
         data_collator=data_collator)
     trainer.train()
