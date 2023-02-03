@@ -295,13 +295,13 @@ def add_quote_annotations(docs, anns):
                     i = 0
                 else:
                     continue
-                labels[i] = 'B-' + ('DIRECT' if a['direct'] else 'INDIRECT') + a['offset']
+                labels[i] = 'B-' + ('DIRECT' if a['direct'] == 'true' else 'INDIRECT') + a['offset']
                 i += 1
                 while i < len(d['tokens']) \
                       and (d['s_ids'][i] < int(a['endSentenceId']) \
                            or (d['s_ids'][i] == int(a['endSentenceId']) \
                                and d['w_ids'][i] <= int(a['endWordId']))):
-                    labels[i] = 'I-' + ('DIRECT' if a['direct'] else 'INDIRECT') + a['offset']
+                    labels[i] = 'I-' + ('DIRECT' if a['direct'] == 'true' else 'INDIRECT') + a['offset']
                     i += 1
         labels_per_doc.append(labels)
     docs = docs.add_column('quote-tags', labels_per_doc)\
@@ -533,6 +533,15 @@ if __name__ == '__main__':
                 #      ENT_LABELS[results_2[i]])
                 results_1_words.append(QUOTE_LABELS[results_1[i]])
                 results_2_words.append(ENT_LABELS[results_2[i]])
+            # TODO extract spans document-wide first and then group them
+            # if d['doc_id'] == cur_doc_id:
+            #    quote_spans.extend(extract_spans(...))
+            #    ent_spans.extend(extract_spans(...))
+            # else:
+            #     quotes = group_spans(...)
+            #     for q in quotes:
+            #         ....
+            #     quote_spans, ent_spans = [], []
             quote_spans = extract_spans(results_1_words)
             ent_spans = extract_spans(results_2_words)
             quotes = group_spans(quote_spans, ent_spans)
