@@ -1,6 +1,7 @@
 import argparse
 from collections import defaultdict
 import csv
+import math
 import re
 import sys
 
@@ -16,45 +17,6 @@ from transformers import \
     AutoModelForTokenClassification
 from transformers.modeling_outputs import TokenClassifierOutput
 
-# TODO
-# - load the corpus from CoNLL (paragraph-wise)
-# - add the entity annotations (paragraph-wise without a problem)
-# - add the quote annotations
-#   - process the paragraphs by document
-#   - translate the pairs (sentenceId, wordId) to (paragraphIdx, tokenIdx)
-#   - in order to determine the class, count entity mentions between
-#     the quote boundary and the entity span containing the quote head
-#   - print a warning if there is an entity mention within a quote?
-# - print the results
-
-# left to do:
-# - add the speaker offset classes for quotes
-# - (also elsewhere: improve+commit WebAnno coreference processing)
-# - combine annotations?
-# ENTITY annotation -- add nesting level?
-# 
-# is:
-# 3-6776914,15,27,15,28,*->3-2|*->4-3,*[3]|*
-# 3-6776914,15,29,15,31,*->3-2,
-#
-# should be:
-# 3-6776914,15,27,15,28,*->4-3,
-# 3-6776914,15,27,15,31,*->3-2,
-# 
-# 3-6776914 11 15 27 Pirkanmaan O BB-ENTITY  (nesting level: 2)
-# 3-6776914 11 15 28 Jätehuollon O II-ENTITY
-# 3-6776914 11 15 29 toimitusjohtaja O I-ENTITY
-# 3-6776914 11 15 30 Harri O I-ENTITY
-# 3-6776914 11 15 31 Kallio O I-ENTITY
-# 3-6776914 11 15 32 sanoo O O
-# 3-6776914 11 15 33 . O O
-
-# TODO two classification heads:
-# https://discuss.huggingface.co/t/fine-tune-bert-with-two-classification-heads-next-to-each-other/9984
-# TODO bug: don't add 1 to the class if authorHead points to an entity
-# TODO bug: process nested coreference annotations correctly (how?)
-# - do they always have the same structure? how many levels max.?
-# - first: discard nested coreferences?
 
 QUOTE_LABELS = ['O',
           'B-DIRECT+1', 'I-DIRECT+1', 'B-INDIRECT+1', 'I-INDIRECT+1',
@@ -64,13 +26,13 @@ QUOTE_LABELS = ['O',
           'B-DIRECT=1', 'I-DIRECT=1', 'B-INDIRECT=1', 'I-INDIRECT=1',
           'B-DIRECT=2', 'I-DIRECT=2', 'B-INDIRECT=2', 'I-INDIRECT=2',
           'B-DIRECT=3', 'I-DIRECT=3', 'B-INDIRECT=3', 'I-INDIRECT=3',
-          'B-DIRECT=4', 'I-DIRECT=4', 'B-INDIRECT=4', 'I-INDIRECT=4',
           'B-DIRECT-1', 'I-DIRECT-1', 'B-INDIRECT-1', 'I-INDIRECT-1',
           'B-DIRECT-2', 'I-DIRECT-2', 'B-INDIRECT-2', 'I-INDIRECT-2',
           'B-DIRECT-3', 'I-DIRECT-3', 'B-INDIRECT-3', 'I-INDIRECT-3']
 ENT_LABELS = ['O', 'B-ENTITY', 'I-ENTITY']
 LABELS = QUOTE_LABELS + [l for l in ENT_LABELS if l != 'O']
 PAT_AUTHOR_HEAD = re.compile('([0-9]+)-([0-9]+)')
+MAX_OFFSET = 3
 
 
 class TwoHeadedBert(BertPreTrainedModel):
@@ -147,16 +109,16 @@ class DataCollatorForTwoHeadedBert(DataCollatorForTokenClassification):
         import torch
 
         label_names = ['labels_1', 'labels_2']
-        # TODO finished here
-        # - what should the function return???
-        # - a dictionary: { labels_1: <tensor>, labels_2: <tensor> }
-        labels = { label_name: [feature[label_name] for feature in features] for label_name in label_names }
+        labels = { label_name: [feature[label_name] \
+                       for feature in features] \
+                       for label_name in label_names }
         batch = self.tokenizer.pad(
             features,
             padding=self.padding,
             max_length=self.max_length,
             pad_to_multiple_of=self.pad_to_multiple_of,
-            # Conversion to tensors will fail if we have labels as they are not of the same length yet.
+            # Conversion to tensors will fail if we have labels as they
+            # are not of the same length yet.
             return_tensors="pt" if labels is None else None,
         )
 
@@ -168,12 +130,14 @@ class DataCollatorForTwoHeadedBert(DataCollatorForTokenClassification):
         if padding_side == "right":
             for label_name in label_names:
                 batch[label_name] = [
-                    label + [self.label_pad_token_id] * (sequence_length - len(label)) for label in labels[label_name]
+                    label + [self.label_pad_token_id] * (sequence_length - len(label)) \
+                        for label in labels[label_name]
                 ]
         else:
             for label_name in label_names:
                 batch[label_name] = [
-                    [self.label_pad_token_id] * (sequence_length - len(label)) + label for label in labels[label_name]
+                    [self.label_pad_token_id] * (sequence_length - len(label)) + label \
+                        for label in labels[label_name]
                 ]
 
         batch = {k: torch.tensor(v, dtype=torch.int64) for k, v in batch.items()}
@@ -231,6 +195,84 @@ def load_annotations(filename):
             results[row['articleId']].append(row)
     return results
 
+
+def add_source_offsets(quote_anns, entity_anns):
+
+    def _compare_spans(y_start, y_end, x_start, x_end=None):
+        # Determines the relative position of the span (x_start, x_end)
+        # to (y_start, y_end).
+        # Returns:
+        # - -1 if (x_start, x_end) is entirely before (y_start, y_end),
+        # - 0 if they overlap,
+        # - 1 if (x_start, x_end) is after (y_start, y_end).
+        # If x_end is not given, just the token x_start is considered.
+        # All the values x_start, x_end, y_start, y_end are tuples:
+        # (sentenceId, wordId).
+        if x_end is None:
+            x_end = x_start
+        if y_start[0] > x_end[0] or \
+                y_start[0] == x_end[0] and y_start[1] > x_end[1]:
+            return -1
+        elif y_end[0] < x_start[0] or \
+                y_end[0] == x_start[0] and y_end[1] < x_start[1]:
+            return 1
+        else:
+            return 0
+
+    for doc_id, quotes in quote_anns.items():
+        for q in quotes:
+            m = PAT_AUTHOR_HEAD.match(q['authorHead'])
+            if m is None:
+                q['offset'] = '00'
+                continue
+            author_idx = (int(m.group(1)), int(m.group(2)))
+            author_pos = _compare_spans(
+                (int(q['startSentenceId']), int(q['startWordId'])),
+                (int(q['endSentenceId']), int(q['endWordId'])),
+                author_idx)
+            entities, e_auth_idx, last_e_auth_pos = [], None, 1
+            for e in entity_anns[doc_id]:
+                e_pos = _compare_spans(
+                    (int(q['startSentenceId']), int(q['startWordId'])),
+                    (int(q['endSentenceId']), int(q['endWordId'])),
+                    (int(e['startSentenceId']), int(e['startWordId'])),
+                    (int(e['endSentenceId']), int(e['endWordId'])))
+                if e_pos == author_pos:
+                    entities.append(e)
+                    e_auth_pos = _compare_spans(
+                        (int(e['startSentenceId']), int(e['startWordId'])),
+                        (int(e['endSentenceId']), int(e['endWordId'])),
+                        author_idx)
+                    if e_auth_pos == 0:
+                        e_auth_idx = len(entities)-1
+                    elif e_auth_pos == -1 and last_e_auth_pos == 1:
+                        # if the author head doesn't point to an entity - it will
+                        # be between two entities -> indicate this by an index
+                        # with a half
+                        e_auth_idx = len(entities) - 1.5
+                    last_e_auth_pos = e_auth_pos
+            # if not found yet -- it will be the last of collected entities
+            if e_auth_idx is None:
+                e_auth_idx = len(entities) - 0.5
+            # Now `entities` should contain a list of entities from the desired
+            # relative position to the quote (before/overlapping/after)
+            # and `e_auth_idx` contains the position of the author in this list.
+            offset = None
+            q['offset'] = '00'
+            if isinstance(e_auth_idx, float):
+                # insert the entity corresponding to the author
+                e_auth_idx = math.ceil(e_auth_idx)
+                entities = entities[:e_auth_idx] + [None] + \
+                           entities[e_auth_idx:]
+            if e_auth_idx <= len(entities):
+                offset = len(entities)-e_auth_idx if author_pos == -1 else e_auth_idx+1
+            if abs(offset) <= MAX_OFFSET:
+                q['offset'] = ('-' if author_pos == -1 \
+                               else '=' if author_pos == 0 \
+                               else '+') \
+                              + str(offset)
+        
+
 def add_quote_annotations(docs, anns):
     cl = Sequence(ClassLabel(num_classes=len(QUOTE_LABELS), names=QUOTE_LABELS))
     labels_per_doc = []
@@ -240,25 +282,10 @@ def add_quote_annotations(docs, anns):
             tok_inv_dict = { (d['s_ids'][i], d['w_ids'][i]) : i \
                              for i in range(len(d['s_ids'])) }
             for a in anns[d['doc_id']]:
-                author_idx = None
-                m = PAT_AUTHOR_HEAD.match(a['QuoteAuthorLink.Lemma'])
-                if m is not None:
-                    author_idx = (int(m.group(1)), int(m.group(2)))
                 start_idx = (int(a['startSentenceId']), int(a['startWordId']))
-                end_idx = (int(a['endSentenceId']), int(a['endWordId']))
-                author_cls = '00'
                 i = None
-                if start_idx in tok_inv_dict and end_idx in tok_inv_dict: # TODO marginal cases later
+                if start_idx in tok_inv_dict:
                     i = tok_inv_dict[start_idx]
-                    j = tok_inv_dict[end_idx]
-                    if author_idx is not None and author_idx in tok_inv_dict:
-                        q = tok_inv_dict[author_idx]
-                        if q < i:
-                            author_cls = '-' + str(len([k for k in range(q+1, i) if d['entity-tags'][k] == 1])+1)
-                        elif q < j:
-                            author_cls = '=' + str(len([k for k in range(i, q) if d['entity-tags'][k] == 1])+ (0 if d['entity-tags'][q] == 2 else 1) )
-                        else:
-                            author_cls = '+' + str(len([k for k in range(j, q) if d['entity-tags'][k] == 1])+ (0 if d['entity-tags'][q] == 2 else 1) )
                 elif (d['s_ids'][0] > int(a['startSentenceId']) \
                       or (d['s_ids'][0] == int(a['startSentenceId']) \
                           and d['w_ids'][0] > int(a['startWordId']))) \
@@ -268,20 +295,24 @@ def add_quote_annotations(docs, anns):
                     i = 0
                 else:
                     continue
-                lbl_direct = 'DIRECT' if a['direct'] == 'true' else 'INDIRECT'
-                labels[i] = 'B-{}{}'.format(lbl_direct, author_cls)
+                labels[i] = 'B-' + ('DIRECT' if a['direct'] else 'INDIRECT') + a['offset']
                 i += 1
                 while i < len(d['tokens']) \
                       and (d['s_ids'][i] < int(a['endSentenceId']) \
                            or (d['s_ids'][i] == int(a['endSentenceId']) \
                                and d['w_ids'][i] <= int(a['endWordId']))):
-                    labels[i] = 'I-{}{}'.format(lbl_direct, author_cls)
+                    labels[i] = 'I-' + ('DIRECT' if a['direct'] else 'INDIRECT') + a['offset']
                     i += 1
         labels_per_doc.append(labels)
     docs = docs.add_column('quote-tags', labels_per_doc)\
                .cast_column('quote-tags', cl)
+
     return docs
 
+# FIXME code duplication with add_quote_annotations()
+# change to: add_annotations(docs, anns, fun)
+# where "fun" makes a class label out of annotation, e.g.
+# fun = lambda x: ('DIRECT' if x['direct'] else 'INDIRECT') + x['offset']
 def add_entity_annotations(docs, anns):
     cl = Sequence(ClassLabel(num_classes=len(ENT_LABELS), names=ENT_LABELS))
     labels_per_doc = []
@@ -332,27 +363,6 @@ def merge_annotations(docs):
     return docs
 
 
-#def tokenize_and_align_labels(examples, max_length):
-#    tokenized_inputs = tokenizer(examples['tokens'], truncation=True, is_split_into_words=True, max_length=max_length)
-#    labels = []
-#    for i, label in enumerate(examples['merged-tags']):
-#        word_ids = tokenized_inputs.word_ids(batch_index=i)
-#        previous_word_idx = None
-#        label_ids = []
-#        for word_idx in word_ids:  # Set the special tokens to -100.
-#            if word_idx is None:
-#                label_ids.append(-100)
-#            elif word_idx != previous_word_idx:  # Only label the first token of a given word.
-#                label_ids.append(label[word_idx])
-#            else:
-#                label_ids.append(-100)
-#            previous_word_idx = word_idx
-#        labels.append(label_ids)
-#    
-#    tokenized_inputs['labels'] = labels
-#    return tokenized_inputs
-
-
 def tokenize_and_align_labels(examples, max_length):
     tokenized_inputs = tokenizer(
         examples['tokens'],
@@ -377,52 +387,38 @@ def tokenize_and_align_labels(examples, max_length):
         labels_2.append(label_2_ids)
     tokenized_inputs['labels_1'] = labels_1
     tokenized_inputs['labels_2'] = labels_2
-    #tokenized_inputs['labels'] = labels_1
     return tokenized_inputs
 
 
 def extract_spans(x):
     spans = []
-    cur_start, cur_label, cur_cont = None, None, None
+    cur_start, cur_label = None, None
     for i in range(len(x)):
-        # finish the current span
         if cur_label is not None and x[i] != 'I-'+cur_label:
-            spans.append((cur_start, i, cur_label, cur_cont))
-            cur_start, cur_label, cur_cont = None, None, None
+            spans.append((cur_start, i, cur_label))
+            cur_label = None
         # start a new span
         if x[i].startswith('B-'):
             cur_start = i
             cur_label = x[i][2:]
-            cur_cont = False
-        # continue a quote span that was interrupted by a quote
-        elif len(spans) >= 2 and x[i].startswith('I-') \
-                and x[i][2:] == spans[-2][2] and i == spans[-1][1]+1:
-            cur_start = spans[-2][0]
-            cur_label = x[i][2:]
-            cur_cont = True
-    if cur_label is not None:    
-        spans.append((cur_start, i, cur_label, cur_cont))
+    if cur_label is not None:
+        spans.append((cur_start, i, cur_label))
     return spans
 
 
-def group_spans(spans):
+def group_spans(quote_spans, ent_spans):
     quotes = []
-    for start, end, label, cont in spans:
-        if label != 'ENTITY':
-            if not cont:
-                quotes.append({ 'label': label, 'start': start, 'end': end,
-                                'ents_before': [], 'ents_inside': [], 'ents_after': [] })
-            elif len(quotes) > 0:
-                quotes[-1]['end'] = end
-    for start, end, label, cont in spans:
-        if label == 'ENTITY':
-            for q in quotes:
-                if end-1 < q['start']:
-                    q['ents_before'].append((start, end))
-                elif start > q['end']-1:
-                    q['ents_after'].append((start, end))
-                else:
-                    q['ents_inside'].append((start, end))
+    for start, end, label in quote_spans:
+        quotes.append({ 'label': label, 'start': start, 'end': end,
+                        'ents_before': [], 'ents_inside': [], 'ents_after': [] })
+    for start, end, label in ent_spans:
+        for q in quotes:
+            if end-1 < q['start']:
+                q['ents_before'].append((start, end))
+            elif start > q['end']-1:
+                q['ents_after'].append((start, end))
+            else:
+                q['ents_inside'].append((start, end))
     for q in quotes:
         q['author'] = None
         direction, offset = q['label'][-2], int(q['label'][-1])
@@ -461,9 +457,10 @@ if __name__ == '__main__':
         docs = load_dataset_from_conll(args.input_file)
         quote_anns = load_annotations(args.annotations_file)
         entity_anns = load_annotations(args.entities_file)
+        add_source_offsets(quote_anns, entity_anns)
+
         docs = add_entity_annotations(docs, entity_anns)
         docs = add_quote_annotations(docs, quote_anns)
-        #docs = merge_annotations(docs)
 
         for d in docs:
             for i, tok in enumerate(d['tokens']):
@@ -475,15 +472,13 @@ if __name__ == '__main__':
         docs = load_dataset_from_conll(args.input_file)
         quote_anns = load_annotations(args.annotations_file)
         entity_anns = load_annotations(args.entities_file)
+        add_source_offsets(quote_anns, entity_anns)
+
         docs = add_entity_annotations(docs, entity_anns)
         docs = add_quote_annotations(docs, quote_anns)
-        #docs = merge_annotations(docs)
-        #docs = docs.select(range(1000, 1100))
 
         tokenizer = AutoTokenizer.from_pretrained('TurkuNLP/bert-base-finnish-cased-v1')
         model = TwoHeadedBert.from_pretrained('TurkuNLP/bert-base-finnish-cased-v1')
-        #model = AutoModelForTokenClassification.from_pretrained('TurkuNLP/bert-base-finnish-cased-v1', num_labels=len(LABELS))
-        
         tokenized_docs = docs.map(
             lambda x: tokenize_and_align_labels(x, 100),
             batched=True)
@@ -512,7 +507,6 @@ if __name__ == '__main__':
         
         docs = load_dataset_from_conll(args.input_file)
         tokenizer = AutoTokenizer.from_pretrained('TurkuNLP/bert-base-finnish-cased-v1')
-        #model = AutoModelForTokenClassification.from_pretrained(args.model_dir)
         model = TwoHeadedBert.from_pretrained(args.model_dir)
 
         writer = csv.DictWriter(
@@ -534,25 +528,26 @@ if __name__ == '__main__':
                 if word_ids[i] is None or word_ids[i] == cur_word_id:
                     continue
                 cur_word_id = word_ids[i]
-                print(d['tokens'][cur_word_id],
-                      QUOTE_LABELS[results_1[i]],
-                      ENT_LABELS[results_2[i]])
+                #print(d['tokens'][cur_word_id],
+                #      QUOTE_LABELS[results_1[i]],
+                #      ENT_LABELS[results_2[i]])
                 results_1_words.append(QUOTE_LABELS[results_1[i]])
                 results_2_words.append(ENT_LABELS[results_2[i]])
-            #spans = extract_spans(results_words)
-            #quotes = group_spans(spans)
-            #for q in quotes:
-            #    writer.writerow({
-            #        'articleId': d['doc_id'], 
-            #        'startSentenceId': d['s_ids'][q['start']],
-            #        'startWordId': d['w_ids'][q['start']],
-            #        'endSentenceId': d['s_ids'][q['end']-1], 
-            #        'endWordId': d['w_ids'][q['end']-1], 
-            #        'direct': str(q['label'].startswith('DIRECT')).lower(),
-            #        'author': ' '.join(d['tokens'][i] for i in range(*q['author'])) \
-            #                  if q['author'] is not None else '_',
-            #        'authorStart': '{}-{}'.format(d['s_ids'][q['author'][0]],
-            #                                      d['w_ids'][q['author'][0]]) \
-            #                        if q['author'] is not None else '_',
-            #    })
+            quote_spans = extract_spans(results_1_words)
+            ent_spans = extract_spans(results_2_words)
+            quotes = group_spans(quote_spans, ent_spans)
+            for q in quotes:
+                writer.writerow({
+                    'articleId': d['doc_id'], 
+                    'startSentenceId': d['s_ids'][q['start']],
+                    'startWordId': d['w_ids'][q['start']],
+                    'endSentenceId': d['s_ids'][q['end']-1], 
+                    'endWordId': d['w_ids'][q['end']-1], 
+                    'direct': str(q['label'].startswith('DIRECT')).lower(),
+                    'author': ' '.join(d['tokens'][i] for i in range(*q['author'])) \
+                              if q['author'] is not None else '_',
+                    'authorStart': '{}-{}'.format(d['s_ids'][q['author'][0]],
+                                                  d['w_ids'][q['author'][0]]) \
+                                    if q['author'] is not None else '_',
+                })
 
