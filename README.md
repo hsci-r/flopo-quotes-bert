@@ -30,9 +30,9 @@ files correspond to the `*-corpus.csv`, `*-quotes.csv` and `*-coref.csv` files.
 ## Running a trained model on new data
 
 ```
-python3 quotes-bert.py run -i INPUT_FILE
+python3 quotes-bert.py run -i INPUT_FILE -m MODEL_DIR
 ```
 
 This takes a corpus file as a parameter and returns a list of recognized
-quotes.
+quotes on standard output.
 
