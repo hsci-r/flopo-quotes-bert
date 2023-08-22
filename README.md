@@ -36,3 +36,6 @@ python3 quotes-bert.py run -i INPUT_FILE -m MODEL_DIR
 This takes a corpus file as a parameter and returns a list of recognized
 quotes on standard output.
 
+The directory `model/` contains a model trained on the data from
+[hsci-r/fi-quote-coref-corpus](https://github.com/hsci-r/fi-quote-coref-corpus),
+annotators 03-10. (Annotators 01-02 were used for evaluation.)
